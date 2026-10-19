@@ -396,6 +396,7 @@ class TestBlynkIntegration(unittest.TestCase):
         self.assertEqual(coordinator.get_mode(), "hardware")
         service = coordinator.telemetry_service
         self.assertIsNotNone(service)
+        service.stop()  # Stop background thread to avoid lock contention on poll_once
         with patch.object(service.client, "fetch_with_retry") as mock_fetch:
             # Cloud reachable but hardware disconnected
             mock_fetch.return_value = ({}, False)
@@ -523,6 +524,55 @@ class TestBlynkIntegration(unittest.TestCase):
             httpd.shutdown()
             httpd.server_close()
             coordinator.close()
+
+    # 20. Smooth Surface Test Mode Presentation Adapter Verification
+    def test_20_smooth_surface_test_mode_presentation_adapter(self):
+        index_html_path = os.path.join(PROJECT_ROOT, "host", "dashboard", "index.html")
+        self.assertTrue(os.path.exists(index_html_path))
+        with open(index_html_path, "r", encoding="utf-8") as f:
+            html = f.read()
+
+        # 1. Verify toggle button and test mode setting
+        self.assertIn('id="btnSmoothTest"', html)
+        self.assertIn("SMOOTH FLOOR TEST: ON", html)
+        self.assertIn("let SMOOTH_SURFACE_TEST_MODE = true;", html)
+        self.assertIn("window.SMOOTH_SURFACE_TEST_MODE = SMOOTH_SURFACE_TEST_MODE;", html)
+        self.assertIn("window.setSmoothSurfaceTestMode = function", html)
+
+        # 2. Verify smoothRoadAdapter structure and 99% smooth / 1% gravel definition
+        self.assertIn("const smoothRoadAdapter =", html)
+        self.assertIn("gravelDuration: 1.0,", html)
+        self.assertIn("surface: \"SMOOTH\"", html)
+        self.assertIn("topIndex: 0", html)
+        self.assertIn("p: [0.99, 0.01, 0.0, 0.0]", html)
+        self.assertIn("surface: \"GRAVEL\"", html)
+        self.assertIn("topIndex: 1", html)
+        self.assertIn("p: [s, g, 0.0, 0.0]", html)
+        self.assertIn("pickGravelConf", html)
+        self.assertIn("Math.floor(5 + Math.random() * 95)", html)
+
+        # 3. Verify Road Panel card presentation adapter override
+        self.assertIn('currentMode === "hardware" && SMOOTH_SURFACE_TEST_MODE', html)
+        self.assertIn("const c = smoothRoadAdapter.getClassification();", html)
+        self.assertIn("top = c.topIndex;", html)
+        self.assertIn("name = c.name;", html)
+        self.assertIn("confVal = c.conf;", html)
+        self.assertIn("pVals = c.p;", html)
+
+        # 4. Verify step-based timeline ribbon rendering
+        self.assertIn("Smooth surface test mode: step-based timeline rendering", html)
+        self.assertIn("activeIvs = smoothRoadAdapter.intervals", html)
+        self.assertIn("rH * 0.99", html)
+        self.assertIn("rH * 0.01", html)
+
+        # 5. Verify telemetry isolation: stiffness, motor, obstacle, pitch remain intact
+        self.assertIn("L.key === \"stiff\" ? [{ get: h => h.s * 100", html)
+        self.assertIn("L.key === \"motor\" ? [{ get: h => h.motor", html)
+        self.assertIn("L.key === \"dist\" ? [{ get: h => h.range", html)
+        self.assertIn("L.key === \"pitch\"", html)
+
+        # 6. Verify single source of truth for Road readout label
+        self.assertIn("smoothRoadAdapter.isGravelAt(h.t) ? \"Gravel\" : \"Smooth\"", html)
 
 
 if __name__ == "__main__":
