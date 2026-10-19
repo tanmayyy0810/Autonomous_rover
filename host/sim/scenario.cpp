@@ -213,7 +213,7 @@ long writeDataset(const DatasetOptions& opt, FILE* out) {
   std::fprintf(out, ",rule_pred\n");
 
   const ClassifierThresholds rules = defaultThresholds();
-  double v_lo, v_hi;
+  double v_lo = 0.0, v_hi = 0.0;
   speedRange(opt.domain, &v_lo, &v_hi);
   long rows = 0;
   for (int run = 0; run < opt.runs; ++run) {

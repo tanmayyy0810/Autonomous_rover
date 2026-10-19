@@ -1,6 +1,12 @@
 host/build/
 host/data/*.csv
+host/data/*.db
 *.o
 __pycache__/
 .DS_Store
 .venv/
+.env
+.env.*
+!.env.example
+*.db
+.vscode/

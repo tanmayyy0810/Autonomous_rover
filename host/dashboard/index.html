@@ -255,12 +255,32 @@
     *, *::before, *::after { animation: none !important; transition: none !important; }
     .js .reveal { opacity: 1 !important; }
   }
+
+  /* Mode selector and status styles */
+  .mode-selector { display: inline-flex; border: 1px solid var(--line-2); border-radius: 4px; overflow: hidden; margin-left: 14px; }
+  .mode-selector button { border: 0; border-radius: 0; background: transparent; color: var(--text-3); font: 600 11.5px/1 var(--cond); letter-spacing: .08em; min-height: 28px; padding: 0 12px; cursor: pointer; transition: background .12s, color .12s; }
+  .mode-selector button + button { border-left: 1px solid var(--line-2); }
+  .mode-selector button:hover { color: var(--text); }
+  .mode-selector button[aria-pressed="true"] { background: var(--signal); color: var(--on-signal); font-weight: 700; }
+  .mode-selector button#btnModeSim[aria-pressed="true"] { background: var(--text); color: var(--bg); }
+  .mode-selector button#btnModeHw[aria-pressed="true"] { background: var(--signal); color: var(--on-signal); }
+
+  .live[data-s="crit"] { border-color: rgba(255, 75, 62, 0.4); background: rgba(255, 75, 62, 0.12); color: var(--crit); }
+  .live[data-s="crit"] i { background: var(--crit); box-shadow: 0 0 6px var(--crit); }
+
+  .hw-banner { display: none; padding: 8px 14px; border-radius: 4px; font: 500 12.5px/1.4 var(--text-font); margin-bottom: 12px; background: var(--raise); border: 1px solid var(--line-2); color: var(--text-2); }
+  .hw-banner.show { display: flex; align-items: center; justify-content: space-between; }
+  .hw-banner b { color: var(--signal); }
 </style>
 </head>
 <body>
 <header class="bar">
   <div class="wrap">
     <div class="mark"><span class="glyph" aria-hidden="true"><i></i><i></i><i></i></span><b>Adaptive Suspension</b><em id="src">CART</em></div>
+    <div class="seg mode-selector" id="modeSelector" role="group" aria-label="Operating Mode">
+      <button type="button" id="btnModeSim" data-mode="sim">SIMULATOR</button>
+      <button type="button" id="btnModeHw" data-mode="hardware">HARDWARE (ESP32)</button>
+    </div>
     <div class="run" id="state" role="status">Connecting</div>
     <span class="grow"></span>
     <span class="clock">T+<b id="clock">--.-</b> s</span>
@@ -272,6 +292,9 @@
 </header>
 
 <main class="wrap">
+  <div id="hwBanner" class="hw-banner" hidden>
+    <span><b>HARDWARE TELEMETRY ACTIVE:</b> Readings ingested via Blynk IoT Cloud from physical ESP32. Local firmware controls autonomous motion; dashboard actuation is read-only.</span>
+  </div>
   <nav class="controls reveal" aria-label="Controls">
     <div class="g">
       <button class="go" data-cmd="start">Start</button>
@@ -417,26 +440,106 @@ function setText(el, s) { if (el._t !== s) { el._t = s; el.textContent = s; } }
 function setHTML(el, s) { if (el._h !== s) { el._h = s; el.innerHTML = s; } }
 function replay(el, cls) { if (reduceMotion) return; el.classList.remove(cls); void el.offsetWidth; el.classList.add(cls); }
 
-// ------------------------------------------------------------------ data
+// ------------------------------------------------------------------ operating mode & data
+let currentMode = "hardware";
+try { currentMode = localStorage.getItem("rover_dashboard_mode") || "hardware"; } catch (e) {}
+
 const hist = [];   // {t, x, v, p, top, s, servo, motor, range, pitch, truePitch, truth, unc, ready}
 let last = null, truth = null, simMode = false, paused = false, frozen = null, dirty = false, lastArrival = 0;
 const view = () => (paused && frozen ? frozen : hist);
+
+function applyMode(mode, notifyServer = true) {
+  if (mode !== "sim" && mode !== "hardware") mode = "hardware";
+  currentMode = mode;
+  try { localStorage.setItem("rover_dashboard_mode", mode); } catch (e) {}
+
+  const isSim = (mode === "sim");
+  $("btnModeSim").setAttribute("aria-pressed", isSim ? "true" : "false");
+  $("btnModeHw").setAttribute("aria-pressed", !isSim ? "true" : "false");
+
+  // Show/hide simulator controls and ground truth
+  document.querySelectorAll(".simonly").forEach(e => e.hidden = !isSim);
+
+  // Controls bar actuation buttons are simulator-only controls
+  const controlsNav = document.querySelector("nav.controls");
+  if (controlsNav) {
+    controlsNav.querySelectorAll("button").forEach(b => {
+      b.disabled = !isSim;
+      b.style.opacity = isSim ? "1" : "0.35";
+      b.style.pointerEvents = isSim ? "auto" : "none";
+    });
+  }
+
+  const banner = $("hwBanner");
+  if (banner) {
+    banner.hidden = isSim;
+    banner.classList.toggle("show", !isSim);
+  }
+
+  // Clear previous history if switching modes so graphs don't mix simulator and hardware
+  hist.length = 0;
+  last = null;
+  truth = null;
+  dirty = true;
+
+  if (isSim) {
+    simMode = true;
+    setText($("src"), "SIMULATOR");
+    $("src").style.color = "";
+    setText($("rLab"), "Road surface / neural ensemble");
+  } else {
+    simMode = false;
+    setText($("src"), "HARDWARE (ESP32)");
+    $("src").style.color = "var(--signal)";
+    setText($("rLab"), "Road surface / ESP32 Pothole Detector");
+  }
+
+  if (notifyServer) {
+    fetch("/api/mode", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode })
+    }).catch(() => {});
+  }
+}
 
 function onLine(line) {
   if (line.startsWith("J,")) {
     let j;
     try { j = JSON.parse(line.slice(2)); } catch (e) { return; }
+
+    // Strict Mode Isolation:
+    // When in HARDWARE mode, reject any simulator J packets
+    if (currentMode === "hardware" && j.source === "sim") return;
+    // When in SIMULATOR mode, reject any blynk J packets
+    if (currentMode === "sim" && j.source === "blynk") return;
+
     const prev = hist[hist.length - 1];
     const v = truth ? truth.v : (j.motor / 255) * EST_VMAX;
     const dt = prev ? clamp(j.t - prev.t, 0, 0.5) : 0;
     last = j;
     lastArrival = performance.now();
+
+    if (currentMode === "hardware") {
+      if (j.hw_online === 1 && j.ready === 1) {
+        setText($("src"), "ESP32 ONLINE");
+        $("src").style.color = "var(--signal)";
+      } else {
+        setText($("src"), "ESP32 OFFLINE");
+        $("src").style.color = "var(--crit)";
+      }
+    } else {
+      setText($("src"), "SIMULATOR");
+      $("src").style.color = "";
+    }
+
     hist.push({ t: j.t, x: prev ? prev.x + v * dt : 0, v, p: j.p, top: j.p.indexOf(Math.max(...j.p)), s: j.s, servo: j.servo,
                 motor: j.motor, range: j.range >= 0 ? j.range : null, pitch: j.pitch, truePitch: truth ? truth.true_pitch : null,
                 truth: truth ? truth.true_surface : null, unc: !!j.uncertain || !j.ready, ready: !!j.ready });
     while (hist.length && hist[0].t < j.t - WINDOW_S - 1) hist.shift();
     dirty = true;
   } else if (line.startsWith("S,")) {
+    if (currentMode === "hardware") return; // S, lines are C++ simulator ground truth - ignore in hardware mode!
     try { truth = JSON.parse(line.slice(2)); } catch (e) { return; }
     if (!simMode) {
       simMode = true;
@@ -444,6 +547,12 @@ function onLine(line) {
       $("src").textContent = "SIMULATOR";
     }
   } else if (line.trim().length) {
+    if (line.startsWith("# mode: ")) {
+      const serverMode = line.slice(8).trim();
+      if ((serverMode === "sim" || serverMode === "hardware") && serverMode !== currentMode) {
+        applyMode(serverMode, false);
+      }
+    }
     addLog(line);
   }
 }
@@ -486,11 +595,58 @@ es.onerror = () => { connErr = true; };
 setInterval(() => {
   const f = $("fresh"), age = (Date.now() - lastMsg) / 1000;
   let s = "wait", txt = connErr ? "No connection" : "Waiting";
-  if (lastMsg && age < 1.5) { s = "live"; txt = "Live"; }
-  else if (lastMsg) { s = "stale"; txt = `No data ${age.toFixed(0)} s`; }
-  f.dataset.s = s; f.querySelector("span").textContent = txt;
+
+  if (currentMode === "hardware") {
+    // Requirements 5, 6, 7:
+    // LIVE means actual fresh hardware telemetry when HARDWARE mode is selected.
+    // If ESP32 is offline, display OFFLINE and show unavailable measurements.
+    // Distinguish the backend's live connection from the ESP32 device's actual online status.
+    const hwOnline = last && last.hw_online === 1 && last.ready === 1;
+    const dataFresh = lastArrival && (performance.now() - lastArrival < 3500);
+
+    if (connErr) {
+      s = "crit"; txt = "Server Disconnected";
+    } else if (!last) {
+      s = "wait"; txt = "Connecting Blynk...";
+    } else if (hwOnline && dataFresh) {
+      s = "live"; txt = "ESP32 LIVE";
+    } else if (!hwOnline) {
+      s = "crit"; txt = "ESP32 OFFLINE";
+    } else {
+      s = "stale"; txt = `Hardware Stale (${((performance.now() - lastArrival) / 1000).toFixed(0)}s)`;
+    }
+  } else {
+    // SIMULATOR mode
+    if (connErr) {
+      s = "crit"; txt = "No connection";
+    } else if (lastMsg && age < 1.5) {
+      s = "live"; txt = "SIM LIVE";
+    } else if (lastMsg) {
+      s = "stale"; txt = `No data ${age.toFixed(0)} s`;
+    }
+  }
+
+  f.dataset.s = s;
+  f.querySelector("span").textContent = txt;
   document.body.classList.toggle("live-on", s === "live");
 }, 500);
+
+// Setup mode selector button event listeners
+$("btnModeSim").addEventListener("click", () => applyMode("sim", true));
+$("btnModeHw").addEventListener("click", () => applyMode("hardware", true));
+
+// Query initial mode from server, honoring localStorage
+fetch("/api/mode")
+  .then(r => r.json())
+  .then(data => {
+    let saved = null;
+    try { saved = localStorage.getItem("rover_dashboard_mode"); } catch (e) {}
+    const m = saved || data.mode || "hardware";
+    applyMode(m, m !== data.mode);
+  })
+  .catch(() => {
+    applyMode(currentMode, true);
+  });
 
 function send(cmd) { fetch("/cmd", { method: "POST", body: cmd }).catch(() => {}); }
 document.querySelectorAll("[data-cmd]").forEach(b => b.addEventListener("click", () => { send(b.dataset.cmd); replay(b, "sent"); }));
@@ -542,13 +698,37 @@ function mix(a, b, t) {
 // ------------------------------------------------------------------ road zone (data-rate part)
 let shownName = "";
 function roadPanel(j) {
+  if (currentMode === "hardware") {
+    setText($("rLab"), "Road surface / ESP32 Pothole Detector");
+    const isHwOnline = (j.hw_online === 1 && j.ready === 1);
+    if (!isHwOnline) {
+      if (shownName !== "OFFLINE") { shownName = "OFFLINE"; setText($("rName"), "OFFLINE"); replay($("rName"), "swap"); }
+      $("rSw").style.background = css("--text-3");
+      $("rFlag").hidden = true;
+      setText($("rConf"), "–");
+      F.conf.to(0);
+      for (let i = 0; i < 4; ++i) F.p[i].to(0);
+      const leds = $("rLeds");
+      if (!leds.children.length) for (let i = 0; i < 20; ++i) leds.appendChild(document.createElement("i"));
+      leds._col = css("--text-3");
+      const probs = $("rProbs");
+      if (!probs.children.length)
+        CLASSES.forEach((c, i) => probs.insertAdjacentHTML("beforeend",
+          `<span class="n">${SHORT[c]}</span><span class="t"><i style="background:var(--c${i})"></i></span><span class="v"></span>`));
+      probs.querySelectorAll(".n").forEach(n => n.classList.remove("on"));
+      probs.querySelectorAll(".v").forEach(v => setText(v, "–"));
+      return;
+    }
+  }
   const top = CLASSES.indexOf(j.top);
   const ok = j.ready && !j.uncertain && top >= 0;
   const name = !j.ready ? "Warming up" : j.uncertain ? "Unsure" : LABEL[j.surface] || LABEL[j.top] || j.surface;
   if (name !== shownName) { shownName = name; setText($("rName"), name); replay($("rName"), "swap"); }
   $("rSw").style.background = ok ? cc(top) : css("--text-3");
   $("rFlag").hidden = !(j.ready && j.uncertain);
-  setText($("rLab"), j.classifier === "ml" ? "Road surface / neural ensemble" : "Road surface / rule-based");
+  if (currentMode !== "hardware") {
+    setText($("rLab"), j.classifier === "ml" ? "Road surface / neural ensemble" : "Road surface / rule-based");
+  }
   const leds = $("rLeds");
   if (!leds.children.length) for (let i = 0; i < 20; ++i) leds.appendChild(document.createElement("i"));
   leds._col = ok ? cc(top) : css("--warn");
@@ -559,7 +739,7 @@ function roadPanel(j) {
   probs.querySelectorAll(".n").forEach((n, i) => n.classList.toggle("on", j.ready && i === top));
   F.conf.to(j.ready ? j.conf : 0);
   for (let i = 0; i < 4; ++i) F.p[i].to(j.ready ? j.p[i] : 0);
-  if (truth) {
+  if (truth && simMode) {
     const ti = CLASSES.indexOf(truth.true_surface);
     setText($("rTruth"), LABEL[truth.true_surface] || truth.true_surface);
     $("rTruth").style.color = ti >= 0 ? cc(ti) : "";
@@ -601,12 +781,32 @@ function buildDial() {
 }
 function dialData(j) {
   if (!dial) buildDial();
+  const isHwOnline = (currentMode !== "hardware") || (j.hw_online === 1 && j.ready === 1);
+
+  if (currentMode === "hardware" && !isHwOnline) {
+    F.servo.to(0);
+    F.dnum.to(0);
+    F.target.to(0);
+    dial.target.style.display = "none";
+    setText(dial.servo, "SCANNER (OFFLINE)");
+    F.exp.to(0); F.risk.to(0); F.sky.to(0);
+    dial.graded = false;
+    setText($("pExp"), "–");
+    setText($("pRisk"), "–");
+    setText($("pSky"), "–");
+    return;
+  }
+
   F.servo.to(clamp((j.servo - 45) / 105, 0, 1));
   F.dnum.to(Math.round(clamp((j.servo - 45) / 105, 0, 1) * 100));
   if (!dialSwept) { dialSwept = true; sweepStart = performance.now(); }
   F.target.to(clamp(j.s, 0, 1));
   dial.target.style.display = j.curve === "graded" && !j.servo_manual ? "" : "none";
-  setText(dial.servo, `SERVO ${j.servo}°${j.servo_manual ? "  MANUAL" : ""}`);
+  if (currentMode === "hardware" || j.classifier === "hardware-pothole") {
+    setText(dial.servo, `SCANNER ${j.servo}°`);
+  } else {
+    setText(dial.servo, `SERVO ${j.servo}°${j.servo_manual ? "  MANUAL" : ""}`);
+  }
   const g = j.curve === "graded";
   F.exp.to(g ? j.s_exp : 0); F.risk.to(g ? j.s_risk : 0); F.sky.to(g ? j.s_sky : 0);
   dial.graded = g;
@@ -615,6 +815,16 @@ function dialData(j) {
 }
 function dialFrame(now) {
   if (!dial) return;
+  if (currentMode === "hardware" && (!last || last.hw_online !== 1 || !last.ready)) {
+    dial.val.setAttribute("d", dArc(0, 0.0001, D.r));
+    dial.ticks.forEach(t => t.setAttribute("stroke", dial.dim));
+    dial.target.style.display = "none";
+    setText($("dialNum"), "–");
+    setText($("pExp"), "–");
+    setText($("pRisk"), "–");
+    setText($("pSky"), "–");
+    return;
+  }
   let s = F.servo.v, sweeping = false;
   if (sweepStart && !reduceMotion) {           // ignition sweep: up to full scale and back, once on connect
     const t = Math.max(0, (now - sweepStart) / 1000), e = (x) => 1 - Math.pow(1 - x, 3);
@@ -635,14 +845,36 @@ function dialFrame(now) {
 // ------------------------------------------------------------------ drive zone
 let distOk = false;
 function driveData(j) {
-  const mode = SPEED_MODE[j.speed_mode] || j.speed_mode;
-  setText($("vLab"), truth ? "Speed" : "Motor");
-  F.speed.to(Math.round(truth ? truth.v * 100 : j.motor));
-  setText($("vSub"), truth ? `Motor PWM ${j.motor}  /  ${mode}` : `${Math.round(j.motor / 2.55)}% power  /  ${mode}`);
+  const isHwOnline = (currentMode !== "hardware") || (j.hw_online === 1 && j.ready === 1);
+  if (currentMode === "hardware") {
+    setText($("vLab"), "Motor Mode");
+    if (!isHwOnline) {
+      F.speed.to(0);
+      setText($("vSub"), "ESP32 Offline");
+      distOk = false;
+      setText($("oBig"), "–");
+      $("oBig").style.color = "";
+      $("oBig").classList.remove("alarm");
+      $("oMark").hidden = true;
+      setText($("cMaint"), "–");
+      setText($("cImp"), "–");
+      setText($("cStops"), "–");
+      return;
+    }
+    const autoActive = j.motor > 0;
+    setText($("vSub"), autoActive ? "Autonomous (Driving)" : "Standby (Stopped)");
+    F.speed.to(j.motor);
+  } else {
+    const mode = SPEED_MODE[j.speed_mode] || j.speed_mode;
+    setText($("vLab"), truth ? "Speed" : "Motor");
+    F.speed.to(Math.round(truth ? truth.v * 100 : j.motor));
+    setText($("vSub"), truth ? `Motor PWM ${j.motor}  /  ${mode}` : `${Math.round(j.motor / 2.55)}% power  /  ${mode}`);
+  }
+
   const st = j.dist_status;
   distOk = st === "OK";
   if (distOk) F.dist.to(Math.round(j.dist));
-  else setHTML($("oBig"), st === "TOO_CLOSE" ? "&lt;2<small>cm</small>" : st === "NO_RESPONSE" ? "No echo" : "Clear");
+  else setHTML($("oBig"), st === "TOO_CLOSE" ? "&lt;2<small>cm</small>" : st === "NO_RESPONSE" ? "No echo" : (st === "stale" ? "Stale" : "Clear"));
   const danger = distOk && j.dist < 10 ? "--crit" : distOk && j.dist < 20 ? "--warn" : "";
   $("oBig").style.color = danger ? css(danger) : "";
   $("oBig").classList.toggle("alarm", danger === "--crit");
@@ -656,13 +888,29 @@ function driveData(j) {
   setText($("cStops"), `${j.estops} / ${j.faults}`);
 }
 function driveFrame() {
-  odoSet($("vBig"), F.speed.v, truth ? "cm/s" : "PWM");
+  if (currentMode === "hardware" && (!last || last.hw_online !== 1 || !last.ready)) {
+    setText($("vBig"), "–");
+    setText($("oBig"), "–");
+    $("oMark").hidden = true;
+    return;
+  }
+  odoSet($("vBig"), F.speed.v, currentMode === "hardware" ? "PWM" : (truth ? "cm/s" : "PWM"));
   if (distOk) odoSet($("oBig"), F.dist.v, "cm");
   const mk = $("oMark");
   if (!mk.hidden) mk.style.transform = `translateX(${(clamp(F.range.v / 150, 0, 1) * mk.parentElement.clientWidth).toFixed(1)}px)`;
 }
 
 function roadFrame() {
+  if (currentMode === "hardware" && (!last || last.hw_online !== 1 || !last.ready)) {
+    setText($("rConf"), "–");
+    const probs = $("rProbs");
+    const f = probs.querySelectorAll(".t i"), v = probs.querySelectorAll(".v");
+    for (let i = 0; i < f.length; ++i) {
+      f[i].style.transform = "scaleX(0)";
+      setText(v[i], "–");
+    }
+    return;
+  }
   setText($("rConf"), last && last.ready ? pct(F.conf.v) : "–");
   const leds = $("rLeds");
   const lit = Math.round(F.conf.v * 20);
@@ -680,14 +928,23 @@ function roadFrame() {
 
 let lastState = "";
 function header(j) {
-  const st = STATES[j.state] || ["", j.state];
   const chip = $("state");
+  if (currentMode === "hardware") {
+    if (j.hw_online !== 1 || !j.ready) {
+      chip.dataset.l = "crit";
+      setText(chip, "ESP32 OFFLINE");
+      lastState = "OFFLINE";
+      setText($("clock"), j.t ? j.t.toFixed(1) : "--.-");
+      return;
+    }
+  }
+  const st = STATES[j.state] || ["", j.state];
   chip.dataset.l = st[0];
   const label = st[1] + (j.state === "FAULT" && j.fault ? `: ${j.fault}` : "");
   if (label !== chip._t) { setText(chip, label); if (lastState) replay(chip, "flash"); }
   lastState = j.state;
   setText($("clock"), j.t.toFixed(1));
-  for (const seg of document.querySelectorAll(".seg")) {
+  for (const seg of document.querySelectorAll(".seg[data-key]")) {
     const v = j[seg.dataset.key];
     seg.querySelectorAll("button").forEach(b => b.setAttribute("aria-pressed", b.dataset.val === v));
   }
@@ -1144,9 +1401,15 @@ function draw3D(dt, now) {
   paint(ground);
   paint(objects);
   if (j) {
-    setText($("hRoll"), `${(j.roll - (att.r ?? j.roll)).toFixed(1)}°`);
-    setText($("hPitch"), `${(j.pitch - (att.p ?? j.pitch)).toFixed(1)}°`);
-    setText($("hStiff"), `${Math.round(stiff * 100)}%`);
+    if (currentMode === "hardware" && (j.hw_online !== 1 || !j.ready)) {
+      setText($("hRoll"), "–");
+      setText($("hPitch"), "–");
+      setText($("hStiff"), "–");
+    } else {
+      setText($("hRoll"), `${(j.roll - (att.r ?? j.roll)).toFixed(1)}°`);
+      setText($("hPitch"), `${(j.pitch - (att.p ?? j.pitch)).toFixed(1)}°`);
+      setText($("hStiff"), `${Math.round(stiff * 100)}%`);
+    }
   }
 }
 
@@ -1399,6 +1662,14 @@ function curve(j) {
   const dot = el("circle", { r: 4.5, fill: css("--signal") }, svg);
   const label = txt(svg, 0, 0, "", { style: `fill:${css("--text")};font-size:13px;font-weight:600;letter-spacing:.08em` });
   curveDot = { halo, dot, label, X, Y, W };
+
+  if (currentMode === "hardware" && (j.hw_online !== 1 || !j.ready)) {
+    F.ceff.to(0); F.s.to(0);
+    setText($("cMeta"), "ESP32 Offline");
+    curveFrame(performance.now());
+    return;
+  }
+
   F.ceff.to(clamp(j.c_eff, 0, 1)); F.s.to(clamp(j.s, 0, 1));
   curveFrame(performance.now());
   setText($("cMeta"), `Trusted from ${pct(j.c_high)}`);
@@ -1412,13 +1683,38 @@ function curveFrame(now) {
   const right = cx > c.W - 120;
   c.label.setAttribute("x", (cx + (right ? -14 : 14)).toFixed(1)); c.label.setAttribute("y", (cy < 34 ? cy + 22 : cy - 12).toFixed(1));
   c.label.setAttribute("text-anchor", right ? "end" : "start");
-  setText(c.label, `NOW ${pct(F.s.v)}`);
+  if (currentMode === "hardware" && (!last || last.hw_online !== 1 || !last.ready)) {
+    setText(c.label, "OFFLINE");
+  } else {
+    setText(c.label, `NOW ${pct(F.s.v)}`);
+  }
 }
 
 // ------------------------------------------------------------------ all values
 function values(j) {
   if (!$("values").open) return;
-  const rows = [["State", j.state], ["Surface (debounced)", j.surface], ["Most likely", j.top],
+  let rows;
+  if (currentMode === "hardware" || j.classifier === "hardware-pothole" || j.source === "blynk") {
+    const isOnline = (j.hw_online === 1 && j.ready === 1);
+    rows = [
+      ["Operating Mode", "HARDWARE (Blynk IoT Cloud)"],
+      ["Hardware Connectivity", isOnline ? "ONLINE (ESP32 Live)" : "OFFLINE (ESP32 Disconnected)"],
+      ["Blynk Cloud Server Status", j.cloud_online ? "Connected" : "Unreachable"],
+      ["Autonomous Mode (V0)", isOnline ? (j.motor > 0 ? "ACTIVE (Driving)" : "STANDBY (Stopped)") : "–"],
+      ["Pothole Alert (V5/V7)", isOnline ? (j.surface === "POTHOLE" ? "ALERT: POTHOLE DETECTED!" : "CLEAR") : "–"],
+      ["Obstacle Distance (V6)", isOnline ? (j.dist_status === "OK" ? j.dist.toFixed(1) + " cm" : (j.dist_status === "none" ? "Path clear / Out of range" : j.dist_status)) : "–"],
+      ["MPU6050 Pitch (V8)", isOnline ? `${j.pitch.toFixed(2)}°` : "–"],
+      ["MPU6050 Roll (V9)", isOnline ? `${j.roll.toFixed(2)}°` : "–"],
+      ["MPU6050 Z-Accel (V10)", isOnline ? `${j.a_vert.toFixed(3)} m/s²` : "–"],
+      ["Obstacle Scanner Servo (V11)", isOnline ? `${j.servo}°` : "–"],
+      ["Fuzzy Speed Recommendation", isOnline ? j.u.toFixed(2) : "–"],
+      ["Closing Speed", isOnline ? j.closing.toFixed(1) + " cm/s" : "–"],
+      ["Pothole Impacts Total", isOnline ? String(j.impacts) : "–"],
+      ["Rover State", isOnline ? j.state : "OFFLINE"],
+      ["Session Elapsed Time", j.t.toFixed(1) + " s"]
+    ];
+  } else {
+    rows = [["State", j.state], ["Surface (debounced)", j.surface], ["Most likely", j.top],
     ...CLASSES.map((c, i) => [`P(${LABEL[c].toLowerCase()})`, (j.p[i] * 100).toFixed(1) + "%"]),
     ["Confidence", j.conf.toFixed(3)], ["Ensemble disagreement (MI)", j.mi.toFixed(4)], ["Novelty", j.novelty.toFixed(1)],
     ["Uncertain", j.uncertain ? "yes" : "no"], ["Effective confidence", j.c_eff.toFixed(3)], ["Gate", j.gate.toFixed(3)],
@@ -1429,8 +1725,9 @@ function values(j) {
     ["Vibration RMS / p-p / jerk", `${j.rms.toFixed(2)} / ${j.p2p.toFixed(2)} / ${j.jerk}`],
     ["Maintenance", `${j.maint}, ${j.maint_tests} tests, ζ ${j.maint_zeta.toFixed(3)}`],
     ["Impacts / e-stops / faults", `${j.impacts} / ${j.estops} / ${j.faults}`], ["Cart time", j.t.toFixed(2) + " s"]];
-  if (truth) rows.push(["True surface (sim)", truth.true_surface], ["True speed (sim)", (truth.v * 100).toFixed(1) + " cm/s"],
-                       ["Shock condition (sim)", pct(truth.wear)], ["Bottom-outs (sim)", truth.bottom_outs]);
+    if (truth) rows.push(["True surface (sim)", truth.true_surface], ["True speed (sim)", (truth.v * 100).toFixed(1) + " cm/s"],
+                         ["Shock condition (sim)", pct(truth.wear)], ["Bottom-outs (sim)", truth.bottom_outs]);
+  }
   setHTML($("vt"), rows.map(r => `<div><span>${r[0]}</span><b>${r[1]}</b></div>`).join(""));
 }
 
