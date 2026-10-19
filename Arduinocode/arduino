@@ -1,0 +1,342 @@
+#define BLYNK_TEMPLATE_ID   "TMPLxxxxxx"
+#define BLYNK_TEMPLATE_NAME "Autonomous Rover"
+#define BLYNK_AUTH_TOKEN    "Blynk_Token"
+
+#define BLYNK_PRINT Serial
+
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <BlynkSimpleEsp32.h>
+#include <Wire.h>
+
+// WiFi Configuration
+char ssid[] = "Wi-fi";
+char pass[] = "password";
+
+// --- PIN DEFINITIONS (ESP32 DevKit V1) ---
+const int PIN_TRIG = 25;
+const int PIN_ECHO = 26;
+
+const int PIN_SDA  = 21;
+const int PIN_SCL  = 22;
+uint8_t mpuAddr    = 0x68;
+
+const int PIN_SERVO = 33;
+
+const int PIN_ENA = 18;
+const int PIN_IN1 = 27;
+const int PIN_IN2 = 14;
+const int PIN_ENB = 19;
+const int PIN_IN3 = 23;
+const int PIN_IN4 = 13;
+
+// --- MOTOR INVERSION ---
+const bool INVERT_LEFT_MOTOR  = true;
+const bool INVERT_RIGHT_MOTOR = true;
+
+// --- BEHAVIOR & SPEED PARAMETERS ---
+const int SAFE_DISTANCE_CM  = 25;  
+const int BASE_DRIVE_SPEED  = 225; // Increased to overcome L298N internal voltage drop (Range: 0-255)
+const int REVERSE_SPEED     = 205; 
+const int PIVOT_SPEED       = 230; 
+const int REVERSE_MS        = 300; 
+const int PIVOT_MS          = 350; 
+
+const int SERVO_LOOK_L      = 150; 
+const int SERVO_LOOK_C      = 90;  
+const int SERVO_LOOK_R      = 30;  
+
+// --- GLOBAL TELEMETRY & STATES ---
+bool autoActive = false;
+bool potholeAlert = false;
+unsigned long potholeTimestamp = 0;
+long latestDistance = 0;
+
+float currentPitch = 0.0;
+float currentRoll  = 0.0;
+float currentAccZ_ms2 = 9.81;
+int currentServoAngle = 90;
+bool mpuOnline = false;
+
+BlynkTimer timer;
+
+// --- MOTOR CONTROL ---
+void runMotors(int leftDir, int rightDir, int speedVal) {
+  if (INVERT_LEFT_MOTOR)  leftDir  = -leftDir;
+  if (INVERT_RIGHT_MOTOR) rightDir = -rightDir;
+
+  if (leftDir > 0) {
+    digitalWrite(PIN_IN1, HIGH); digitalWrite(PIN_IN2, LOW);
+  } else if (leftDir < 0) {
+    digitalWrite(PIN_IN1, LOW);  digitalWrite(PIN_IN2, HIGH);
+  } else {
+    digitalWrite(PIN_IN1, LOW);  digitalWrite(PIN_IN2, LOW);
+  }
+
+  if (rightDir > 0) {
+    digitalWrite(PIN_IN3, HIGH); digitalWrite(PIN_IN4, LOW);
+  } else if (rightDir < 0) {
+    digitalWrite(PIN_IN3, LOW);  digitalWrite(PIN_IN4, HIGH);
+  } else {
+    digitalWrite(PIN_IN3, LOW);  digitalWrite(PIN_IN4, LOW);
+  }
+
+  int applied = (leftDir == 0 && rightDir == 0) ? 0 : speedVal;
+  #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+    ledcWrite(PIN_ENA, applied);
+    ledcWrite(PIN_ENB, applied);
+  #else
+    ledcWrite(0, applied);
+    ledcWrite(1, applied);
+  #endif
+}
+
+void stopAll() {
+  runMotors(0, 0, 0);
+}
+
+void driveForward(int speed = BASE_DRIVE_SPEED) {
+  runMotors(1, 1, speed);
+}
+
+void driveReverse(int speed = REVERSE_SPEED) {
+  runMotors(-1, -1, speed);
+}
+
+void pivotLeft(int speed = PIVOT_SPEED) {
+  runMotors(-1, 1, speed);
+}
+
+void pivotRight(int speed = PIVOT_SPEED) {
+  runMotors(1, -1, speed);
+}
+
+// --- SERVO CONTROL ---
+void aimServo(int angle) {
+  angle = constrain(angle, 0, 180);
+  currentServoAngle = angle;
+  
+  uint32_t duty = (uint32_t)(((angle / 180.0f * 2000.0f + 500.0f) / 20000.0f) * 65535.0f);
+  #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+    ledcWrite(PIN_SERVO, duty);
+  #else
+    ledcWrite(2, duty);
+  #endif
+  
+  Blynk.virtualWrite(V11, currentServoAngle);
+  delay(180);
+}
+
+// --- ULTRASONIC RANGE SENSING ---
+long singlePingCM(unsigned long timeout_us = 25000UL) {
+  digitalWrite(PIN_TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(PIN_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(PIN_TRIG, LOW);
+
+  unsigned long dur = pulseIn(PIN_ECHO, HIGH, timeout_us);
+  if (dur == 0) return 999;
+  return dur / 58;
+}
+
+long getMedianDistanceCM() {
+  const int SAMPLES = 3;
+  long d[SAMPLES];
+  for (int i = 0; i < SAMPLES; i++) {
+    d[i] = singlePingCM();
+    delay(4);
+  }
+  if (d[0] > d[1]) { long t = d[0]; d[0] = d[1]; d[1] = t; }
+  if (d[1] > d[2]) { long t = d[1]; d[1] = d[2]; d[2] = t; }
+  if (d[0] > d[1]) { long t = d[0]; d[0] = d[1]; d[1] = t; }
+  return d[1];
+}
+
+int evaluateBestTurn() {
+  aimServo(SERVO_LOOK_L);
+  long distLeft = getMedianDistanceCM();
+
+  aimServo(SERVO_LOOK_R);
+  long distRight = getMedianDistanceCM();
+
+  aimServo(SERVO_LOOK_C);
+  return (distLeft >= distRight) ? 1 : -1;
+}
+
+void avoidObstacle() {
+  stopAll();
+  delay(80);
+
+  driveReverse();
+  delay(REVERSE_MS);
+  stopAll();
+  delay(80);
+
+  int turnDir = evaluateBestTurn();
+
+  if (turnDir > 0) {
+    pivotLeft();
+  } else {
+    pivotRight();
+  }
+  delay(PIVOT_MS);
+
+  stopAll();
+  delay(80);
+}
+
+// --- MPU-6050 MANAGEMENT ---
+bool tryWakeMPU(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  Wire.write(0x6B);
+  Wire.write(0x00);
+  return (Wire.endTransmission(true) == 0);
+}
+
+void initMPU() {
+  Wire.end();
+  delay(10);
+  Wire.begin(PIN_SDA, PIN_SCL);
+  Wire.setClock(100000);
+  Wire.setTimeOut(25);
+
+  if (tryWakeMPU(0x68)) {
+    mpuAddr = 0x68;
+    mpuOnline = true;
+    Serial.println("[MPU6050] Connected and awake at 0x68");
+  } else if (tryWakeMPU(0x69)) {
+    mpuAddr = 0x69;
+    mpuOnline = true;
+    Serial.println("[MPU6050] Connected and awake at 0x69");
+  } else {
+    mpuOnline = false;
+    Serial.println("[MPU6050] Not detected! Rechecking bus...");
+  }
+}
+
+void readAndCheckIMU() {
+  if (!mpuOnline) {
+    initMPU();
+    return;
+  }
+
+  Wire.beginTransmission(mpuAddr);
+  Wire.write(0x3B);
+  byte error = Wire.endTransmission(true);
+
+  if (error != 0) {
+    mpuOnline = false;
+    return;
+  }
+
+  uint8_t count = Wire.requestFrom((uint8_t)mpuAddr, (uint8_t)6, (uint8_t)true);
+  if (count == 6) {
+    int16_t rawX = (Wire.read() << 8) | Wire.read();
+    int16_t rawY = (Wire.read() << 8) | Wire.read();
+    int16_t rawZ = (Wire.read() << 8) | Wire.read();
+
+    float ax = rawX / 16384.0f;
+    float ay = rawY / 16384.0f;
+    float az = rawZ / 16384.0f;
+
+    if (ax == 0.0f && ay == 0.0f && az == 0.0f) {
+      mpuOnline = false;
+      return;
+    }
+
+    currentAccZ_ms2 = az * 9.81f;
+    currentPitch    = atan2(-ax, sqrt(ay * ay + az * az)) * 180.0f / PI;
+    currentRoll     = atan2(ay, az) * 180.0f / PI;
+
+    float totalAcc = sqrt(ax * ax + ay * ay + az * az);
+
+    if (totalAcc < 0.55f || totalAcc > 1.75f) {
+      if (!potholeAlert || (millis() - potholeTimestamp > 1500)) {
+        potholeAlert = true;
+        potholeTimestamp = millis();
+        Blynk.virtualWrite(V5, 1);
+        Blynk.virtualWrite(V7, "POTHOLE!");
+      }
+    } else if (potholeAlert && (millis() - potholeTimestamp > 1500)) {
+      potholeAlert = false;
+      Blynk.virtualWrite(V5, 0);
+      Blynk.virtualWrite(V7, "CLEAR");
+    }
+  } else {
+    mpuOnline = false;
+  }
+}
+
+// --- TELEMETRY BROADCAST ---
+void pushTelemetry() {
+  if (latestDistance > 0 && latestDistance < 400) {
+    Blynk.virtualWrite(V6, latestDistance);
+  }
+  Blynk.virtualWrite(V8, currentPitch);
+  Blynk.virtualWrite(V9, currentRoll);
+  Blynk.virtualWrite(V10, currentAccZ_ms2);
+  Blynk.virtualWrite(V11, currentServoAngle);
+
+  Serial.printf("[LIVE] Pitch: %.1f | Roll: %.1f | AccZ: %.2f m/s2 | Pothole: %s\n",
+                currentPitch, currentRoll, currentAccZ_ms2, potholeAlert ? "YES" : "NO");
+}
+
+// --- BLYNK START/STOP SWITCH ---
+BLYNK_WRITE(V0) {
+  autoActive = (param.asInt() == 1);
+  if (autoActive) {
+    aimServo(SERVO_LOOK_C);
+  } else {
+    stopAll();
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(PIN_TRIG, OUTPUT);
+  pinMode(PIN_ECHO, INPUT);
+  digitalWrite(PIN_TRIG, LOW);
+
+  pinMode(PIN_IN1, OUTPUT);
+  pinMode(PIN_IN2, OUTPUT);
+  pinMode(PIN_IN3, OUTPUT);
+  pinMode(PIN_IN4, OUTPUT);
+
+  // High-frequency 18 kHz PWM on motor pins silences coil whine
+  #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+    ledcAttach(PIN_ENA, 18000, 8);
+    ledcAttach(PIN_ENB, 18000, 8);
+    ledcAttach(PIN_SERVO, 50, 16);
+  #else
+    ledcSetup(0, 18000, 8); ledcAttachPin(PIN_ENA, 0);
+    ledcSetup(1, 18000, 8); ledcAttachPin(PIN_ENB, 1);
+    ledcSetup(2, 50, 16);   ledcAttachPin(PIN_SERVO, 2);
+  #endif
+
+  stopAll();
+  aimServo(SERVO_LOOK_C);
+
+  initMPU();
+
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+
+  timer.setInterval(250L, pushTelemetry);
+  timer.setInterval(60L, readAndCheckIMU);
+}
+
+void loop() {
+  Blynk.run();
+  timer.run();
+
+  if (autoActive) {
+    latestDistance = getMedianDistanceCM();
+
+    if (latestDistance <= SAFE_DISTANCE_CM) {
+      avoidObstacle();
+    } else {
+      driveForward();
+    }
+  }
+}
